@@ -1,0 +1,898 @@
+# AI Agent 学习笔记：Qwen3.5 适配实践
+
+# AI Agent 学习笔记
+
+基于对 `learn-claude-code` 仓库的学习与 Qwen3.5 适配实践
+
+---
+
+## 一、Agent 的本质认知
+
+### 1.1 Agent 是模型，不是框架
+
+**核心观点**：Agent 是一个神经网络（Transformer、RNN），经过数十亿次梯度更新，在行动序列数据上学会了感知环境、推理目标、采取行动。
+
+**历史佐证**：
+
+| 时间        | 里程碑                       | 本质            |
+| --------- | ------------------------- | ------------- |
+| 2013      | DeepMind DQN 玩 Atari      | 神经网络从像素学习游戏策略 |
+| 2019      | OpenAI Five 征服 Dota 2     | 神经网络学会团队协作    |
+| 2019      | DeepMind AlphaStar 制霸星际争霸 | 神经网络学会实时战略    |
+| 2024-2025 | LLM Agent 编程              | 神经网络学会代码生成与调试 |
+| **关键区分**： |                           |               |
+
+- **Agent（模型）**：决策者，自主决定下一步做什么
+
+- **Harness（框架）**：执行环境，提供工具、知识、权限边界
+
+"你不是在编写智能，你是在构建智能栖居的世界" —— 造好 Harness，Agent 会完成剩下的。
+
+### 1.2 Agent 不是什么
+
+- ❌ 不是提示词链：把 LLM API 调用用 if-else 串起来不是 Agent
+
+- ❌ 不是拖拽式工作流：无代码平台的节点图不是 Agent
+
+- ❌ 不是框架本身：LangChain、LlamaIndex 等是 Harness，不是 Agent
+
+**真正的 Agent**：模型自主决定控制流，框架只提供工具执行机制。
+
+---
+
+## 二、核心循环：Agent Loop
+
+### 2.1 为什么需要循环？
+
+**核心问题**：Agent 解决任务需要多步推理，每步可能调用工具，工具结果又影响下一步。
+
+**示例场景**：
+
+```Plain
+用户：帮我找出项目中所有使用了旧版API的文件并更新
+
+步骤1：模型 → 需要搜索文件 → 调用 bash("find . -name '*.py'")
+步骤2：模型 ← 看到文件列表 ← 工具返回
+步骤3：模型 → 需要查看文件内容 → 调用 read("file1.py")
+步骤4：模型 ← 看到内容，发现确实用了旧API ← 工具返回
+步骤5：模型 → 需要修改 → 调用 write("file1.py", 新内容)
+步骤6：模型 ← 确认完成 ← 工具返回
+步骤7：模型 → 任务完成，回复用户
+```
+
+**关键**：步骤数量不确定，只有模型自己能判断"是否完成"。
+
+### 2.2 最小循环结构
+
+```Python
+def agent_loop(messages):
+    while True:  # 不确定要循环多少次
+        # 1. 调用模型，问"现在该干嘛？"
+        response = llm.create(messages=messages, tools=TOOLS)
+
+        # 2. 记录模型回复
+        messages.append({"role": "assistant", "content": response.content})
+
+        # 3. 检查是否继续：模型说要工具就继续，否则结束
+        if not 模型要调用工具:
+            return  # 任务完成，退出循环
+
+        # 4. 执行工具
+        results = execute_tools(response.tool_calls)
+
+        # 5. 工具结果反馈给模型，让它基于新信息再决策
+        messages.append({"role": "user/tool", "content": results})
+        # 循环继续...
+```
+
+**循环逻辑可视化**：
+
+```Plain
+用户提问 ──→ 模型推理 ──→ 要工具？──→ 执行工具 ──→ 结果反馈 ──→ 模型再推理 ──→ 完成？
+                ↑___________________________________________________________|
+```
+
+---
+
+## 三、深度解析：为什么 `agent_loop(messages: list)` 这么写？
+
+### 3.1 困惑的本质
+
+"语法都认识，但是不知道为什么这么写"
+
+**根本原因**：不熟悉 Qwen/OpenAI API 的返回结构，看不懂代码在"拆"什么。
+
+就像收到一个包裹，但不知道里面有什么，自然看不懂为什么那样拆包装。
+
+### 3.2 先看 API 实际返回什么
+
+假设用户说："查看当前目录文件"
+
+#### 第一次调用（模型决定调用工具）
+
+```Python
+response = client.chat.completions.create(...)
+```
+
+**实际返回的 ** **`response`** ** 对象**（简化）：
+
+```Python
+{
+    "id": "chatcmpl-abc123",
+    "object": "chat.completion", 
+    "created": 1712345678,
+    "model": "qwen-plus",
+    "choices": [  # 为什么是数组？因为可以批量生成多个回复
+        {
+            "index": 0,
+            "message": {  # ← 这是模型的回复！
+                "role": "assistant",
+                "content": null,  # ← 为什么是 null？因为没说话，直接要调用工具
+                "tool_calls": [   # ← 关键！模型说要调用这些工具
+                    {
+                        "id": "call_abc123",  # ← 这个 ID 必须记住，后面要对上
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": '{"command": "ls -la"}'  # ← JSON 字符串！
+                        }
+                    }
+                ]
+            },
+            "finish_reason": "tool_calls"  # ← 关键！因为调用了工具，所以循环继续
+        }
+    ],
+    "usage": {...}
+}
+```
+
+**代码对应拆解**：
+
+```Python
+response.choices[0]           # 取第一个（也是唯一一个）选择
+message = response.choices[0].message  # 模型的消息对象
+
+message.content               # null → 代码用 "" 替代
+message.tool_calls            # 数组，包含要调用的工具
+message.tool_calls[0].id      # "call_abc123"
+message.tool_calls[0].function.name      # "bash"
+message.tool_calls[0].function.arguments # '{"command": "ls -la"}'（字符串！）
+
+finish_reason = response.choices[0].finish_reason  # "tool_calls"
+```
+
+#### 第二次调用（模型看到工具结果，决定完成）
+
+执行完 `ls -la`，把结果塞回 `messages`，再次调用 API：
+
+```Python
+messages = [
+    {"role": "system", "content": "You are..."},
+    {"role": "user", "content": "查看当前目录文件"},
+    {"role": "assistant", "content": "", "tool_calls": [...]},  # 之前说要调用工具
+    {"role": "tool", "tool_call_id": "call_abc123", "content": "file1.py\nfile2.txt"},  # 工具返回
+]
+```
+
+**这次返回的 ** **`response`**：
+
+```Python
+{
+    "choices": [
+        {
+            "message": {
+                "role": "assistant",
+                "content": "当前目录包含两个文件：\n- file1.py\n- file2.txt",  # ← 有内容了！
+                "tool_calls": null  # ← 不再调用工具
+            },
+            "finish_reason": "stop"  # ← 关键！模型说"我说完了"
+        }
+    ]
+}
+```
+
+**代码判断**：
+
+```Python
+finish_reason = "stop"  # 不是 "tool_calls"
+# 所以 if finish_reason != "tool_calls" → True → return，结束循环
+```
+
+### 3.3 逐行拆解 `agent_loop` 函数
+
+#### 函数定义
+
+```Python
+def agent_loop(messages: list):  # 为什么参数是 messages？
+```
+
+**`messages`** ** 是什么？**
+
+```Python
+# 调用前，messages 长这样：
+[
+    {"role": "user", "content": "查看当前目录文件"},  # 用户请求
+    # 下面会随着循环动态增加...
+]
+```
+
+**为什么用列表？**  
+
+因为对话有上下文。模型需要看到**完整历史**才能理解现在该做什么。
+
+#### 无限循环
+
+```Python
+    while True:  # 为什么是无限循环？
+```
+
+**因为不知道要循环几次**：
+
+- 简单任务：1 次（直接回答，不调用工具）
+
+- 一般任务：2-3 次（调用工具 → 看到结果 → 完成）
+
+- 复杂任务：5-10 次（多次工具调用组合）
+
+**谁来结束循环？**  
+
+不是程序员，是**模型自己**决定（通过 `finish_reason`）。
+
+#### 调用模型
+
+```Python
+        # 1. 调用模型
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SYSTEM}] + messages,  # 为什么拼接？
+            tools=TOOLS,
+            tool_choice="auto",
+            max_tokens=8000,
+        )
+```
+
+**为什么 ** **`messages`** ** 要拼接？**
+
+```Python
+# 最终发送给模型的消息结构：
+[
+    {"role": "system", "content": "You are a coding agent..."},  # 系统指令（告诉模型它是谁）
+    {"role": "user", "content": "查看当前目录文件"},             # 用户问题
+    {"role": "assistant", "content": "", "tool_calls": [...]},   # 模型说要调用工具（如果有）
+    {"role": "tool", "tool_call_id": "...", "content": "file1\nfile2"},  # 工具返回结果
+    # ... 可能还有更多轮次
+]
+```
+
+**`SYSTEM`** ** 为什么要单独放？**  
+
+OpenAI 格式要求系统消息必须在最前面，告诉模型"你是谁、你能做什么"。
+
+#### 解析响应
+
+```Python
+        message = response.choices[0].message  # 为什么是 choices[0]？
+```
+
+**OpenAI 的设计**：API 支持**批量生成多个回复**（n > 1），所以返回数组。  
+
+但我们只生成 1 个，所以永远取第 0 个。
+
+#### 记录助手消息
+
+```Python
+        # 2. 构建助手消息记录
+        assistant_msg = {
+            "role": "assistant",
+            "content": message.content or ""  # 为什么用 or ""？
+        }
+
+        if message.tool_calls:
+            assistant_msg["tool_calls"] = [...]  # 为什么加这个字段？
+
+        messages.append(assistant_msg)  # 为什么要 append？
+```
+
+**核心原因**：
+
+- 构建 `assistant_msg`：把模型的回复加入历史，让下一轮循环能看到"模型之前说了什么"。
+
+- `message.content or ""`：模型调用工具时 `content` 可能为 `None`，需转为字符串。
+
+- `append` 到 `messages`：保持对话历史完整，模型能看到自己之前的决策。
+
+#### 检查停止原因
+
+```Python
+        # 3. 检查停止原因（最关键的逻辑）
+        finish_reason = response.choices[0].finish_reason
+
+        if finish_reason != "tool_calls":  # 为什么是这个判断？
+            return  # 为什么直接 return？
+```
+
+**这是循环的"出口"！**
+
+| `finish_reason` 值                           | 含义        | 行动      |
+| ------------------------------------------- | --------- | ------- |
+| `"tool_calls"`                              | 模型说要调用工具  | 继续循环    |
+| `"stop"`                                    | 模型说"我说完了" | 结束循环，返回 |
+| `"length"`                                  | token 超限制 | 结束循环，返回 |
+| **判断逻辑**：只要不是"要调用工具"，就说明模型认为任务完成（或出错），循环结束。 |           |         |
+
+#### 执行工具
+
+```Python
+        # 4. 执行工具调用
+        for tool_call in message.tool_calls:  # 为什么是循环？
+```
+
+**原因**：理论上模型可能同时调用多个工具（本例通常仅1个）。
+
+#### 解析参数
+
+```Python
+            # 解析工具名和参数
+            name = tool_call.function.name
+
+            # OpenAI 的参数是 JSON 字符串，需要解析
+            try:
+                arguments = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError:
+                arguments = {}
+```
+
+**核心原因**：OpenAI 接口返回的参数是 JSON 字符串，必须解析为 Python 字典才能使用。
+
+#### 构建结果
+
+```Python
+            # 只处理 bash 工具（本例只有一个工具）
+            if name == "bash":
+                command = arguments.get("command", "")
+                print(f"\033[33m$ {command}\033[0m")  # 黄色显示命令
+
+                # 执行命令
+                output = run_bash(command)
+                print(output[:200])  # 打印前200字符
+
+                # 6. 构建工具结果（关键格式差异）
+                results.append({
+                    "role": "tool",  # OpenAI 特有角色
+                    "tool_call_id": tool_call.id,  # 对应调用的 ID
+                    "content": output
+                })
+```
+
+**关键格式说明**：
+
+- `role="tool"`：OpenAI 强制要求，区分工具返回结果与用户输入。
+
+- `tool_call_id`：关联工具调用与返回结果（多工具调用时必备）。
+
+#### 反馈结果
+
+```Python
+        # 5. 将工具结果加入历史
+        for result in results:
+            messages.append(result)
+```
+
+**原因**：下一轮循环时，模型需要基于工具返回结果做新的决策。
+
+### 3.4 可视化：一轮循环的数据流
+
+```Plain
+开始：messages = [用户问题]
+
+    ↓
+调用 API
+    ↓
+模型返回：{"我想调用 bash", tool_calls: [{id: "call_1", ...}]}
+    ↓
+添加到 messages → [用户问题, 助手说"要调用工具"]
+    ↓
+执行 bash("ls") → 得到 "file1\nfile2"
+    ↓
+构建 tool 消息 → {role: "tool", tool_call_id: "call_1", content: "file1..."}
+    ↓
+添加到 messages → [用户问题, 助手要工具, 工具返回结果]
+    ↓
+循环回到开头，再次调用 API（带着完整历史）
+    ↓
+模型看到历史，决定："任务完成，直接回答"
+    ↓
+finish_reason = "stop" → 退出循环
+```
+
+### 3.5 一句话总结
+
+**`agent_loop`** ** 是一个"对话驱动"的循环：给模型看完整历史 → 模型决定下一步 → 如果需要就执行工具 → 把结果加入历史 → 重复，直到模型说完成。**
+
+`messages` 列表就是**记忆**，`while True` 就是**持续思考**，`finish_reason` 就是**模型的决策信号**。
+
+---
+
+## 四、API 适配：Anthropic vs OpenAI/Qwen
+
+### 4.1 响应结构对比
+
+| 维度     | Anthropic Claude              | OpenAI/Qwen                                |
+| ------ | ----------------------------- | ------------------------------------------ |
+| 调用方法   | `client.messages.create()`    | `client.chat.completions.create()`         |
+| 停止标志字段 | `response.stop_reason`        | `response.choices[0].finish_reason`        |
+| 工具调用值  | `"tool_use"`                  | `"tool_calls"`                             |
+| 完成值    | `"end_turn"`                  | `"stop"`                                   |
+| 工具位置   | `response.content` 数组         | `message.tool_calls` 数组                    |
+| 工具 ID  | `block.id`                    | `tool_call.id`                             |
+| 参数格式   | `block.input` (字典)            | `json.loads(tool_call.function.arguments)` |
+| 结果角色   | `role="user"` + `tool_result` | `role="tool"` + `tool_call_id`             |
+
+### 4.2 关键适配代码
+
+#### Anthropic 版本
+
+```Python
+response = client.messages.create(
+    model=MODEL, system=SYSTEM,
+    messages=messages, tools=TOOLS,
+)
+messages.append({"role": "assistant", "content": response.content})
+
+if response.stop_reason != "tool_use":
+    return
+
+results = []
+for block in response.content:
+    if block.type == "tool_use":
+        output = TOOL_HANDLERS[block.name](**block.input)
+        results.append({
+            "type": "tool_result",
+            "tool_use_id": block.id,
+            "content": output,
+        })
+messages.append({"role": "user", "content": results})
+```
+
+#### OpenAI/Qwen 适配版本
+
+```Python
+response = client.chat.completions.create(
+    model=MODEL,
+    messages=[{"role": "system", "content": SYSTEM}] + messages,
+    tools=TOOLS,
+    tool_choice="auto",
+)
+
+message = response.choices[0].message
+assistant_msg = {
+    "role": "assistant",
+    "content": message.content or "",
+}
+if message.tool_calls:
+    assistant_msg["tool_calls"] = [...]  # 记录调用
+messages.append(assistant_msg)
+
+finish_reason = response.choices[0].finish_reason
+if finish_reason != "tool_calls":
+    return
+
+for tool_call in message.tool_calls:
+    name = tool_call.function.name
+    arguments = json.loads(tool_call.function.arguments)  # 解析 JSON
+    output = TOOL_HANDLERS[name](**arguments)
+
+    # 关键差异：role="tool" 而不是 role="user"
+    messages.append({
+        "role": "tool",
+        "tool_call_id": tool_call.id,  # 必须对应
+        "content": str(output)
+    })
+```
+
+---
+
+## 五、工具调用机制详解
+
+### 5.1 谁决定调用什么工具？
+
+**核心逻辑**：不是硬编码，是模型自主决定
+
+```Plain
+你提供可用工具列表（TOOLS）→ 模型理解用户意图 → 模型选择工具 → 模型生成参数
+```
+
+**示例**：
+
+```Python
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "执行 shell 命令",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                },
+                "required": ["command"]
+            }
+        }
+    }
+]
+
+# 用户说："查看当前目录"
+# 模型返回：
+# name="bash", arguments='{"command": "ls -la"}'
+```
+
+### 5.2 工具执行流程
+
+| 步骤  | 动作    | 数据来源                                       |
+| --- | ----- | ------------------------------------------ |
+| 1   | 解析工具名 | `tool_call.function.name`                  |
+| 2   | 解析参数  | `json.loads(tool_call.function.arguments)` |
+| 3   | 查找处理器 | `TOOL_HANDLERS[name]`                      |
+| 4   | 执行工具  | `handler(**arguments)`                     |
+| 5   | 返回结果  | 封装为 `role="tool"` 消息                       |
+
+### 5.3 为什么 `command` 不是硬编码？
+
+```Python
+# 模型生成的（动态）
+arguments = {"command": "ls -la"}  # 用户说"看目录" → 模型生成 ls
+
+# 模型也可能生成其他命令
+arguments = {"command": "pwd"}       # 用户说"我在哪"
+arguments = {"command": "cat file.txt"}  # 用户说"看文件内容"
+```
+
+**核心原因**：`command` 是模型根据上下文动态生成的字符串，代码只是取出并执行。
+
+### 5.4 通用工具分发模式
+
+```Python
+# 避免写很多 if/else，用字典映射
+TOOL_HANDLERS = {
+    "bash": run_bash,
+    "read": read_file,
+    "write": write_file,
+}
+
+def execute_tool(tool_call):
+    name = tool_call.function.name
+    arguments = json.loads(tool_call.function.arguments)
+
+    handler = TOOL_HANDLERS.get(name)
+    if not handler:
+        return f"未知工具: {name}"
+
+    return handler(**arguments)
+```
+
+---
+
+## 六、垂直领域 Agent
+
+### 6.1 核心公式
+
+```Plain
+垂直领域 Agent = 通用推理模型 + 领域专用工具集 + 领域知识库 + 安全边界
+```
+
+### 6.2 领域工具示例
+
+| 领域  | 专用工具                         | 功能       |
+| --- | ---------------------------- | -------- |
+| 医疗  | `query_patient_record()`     | 查询病历     |
+|     | `check_drug_interaction()`   | 检查药物相互作用 |
+|     | `schedule_exam()`            | 预约检查     |
+| 金融  | `query_stock_price()`        | 查询股价     |
+|     | `calculate_risk_portfolio()` | 计算投资风险   |
+|     | `execute_trade()`            | 执行交易     |
+| 法律  | `search_case_law()`          | 检索判例     |
+|     | `draft_contract()`           | 生成合同     |
+| 制造业 | `query_sensor_data()`        | 查询设备传感器  |
+|     | `predict_maintenance()`      | 预测性维护    |
+| 农业  | `query_soil_moisture()`      | 查询土壤湿度   |
+|     | `control_irrigation()`       | 控制灌溉     |
+
+### 6.3 代码体现（医疗领域示例）
+
+```Python
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "query_patient_record",
+            "description": "查询患者历史病历、检查报告、用药记录",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patient_id": {"type": "string"},
+                    "date_range": {"type": "string", "description": "如 2024-01-01~2024-03-01"}
+                },
+                "required": ["patient_id"]
+            }
+        }
+    },
+    {
+        "type": "function", 
+        "function": {
+            "name": "check_drug_interaction",
+            "description": "检查多种药物之间是否存在相互作用风险",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "drugs": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["drugs"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_exam",
+            "description": "为患者预约CT、MRI、血液检查等",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patient_id": {"type": "string"},
+                    "exam_type": {"type": "string", "enum": ["CT", "MRI", "blood_test", "X-ray"]},
+                    "preferred_time": {"type": "string"}
+                },
+                "required": ["patient_id", "exam_type"]
+            }
+        }
+    }
+]
+
+# 领域知识注入
+SYSTEM = """你是三甲医院内科主治医师助手，具备10年临床经验。
+诊疗原则：
+1. 先查病史，再下诊断
+2. 用药前必须检查药物相互作用
+3. 不确定时检索最新文献"""
+```
+
+### 6.4 垂直领域 Agent 架构
+
+```Plain
+┌─────────────────────────────────────────┐
+│              用户提问                    │
+│  "这个糖尿病患者能用阿司匹林吗？"          │
+└─────────────────┬───────────────────────┘
+                  ▼
+┌─────────────────────────────────────────┐
+│              模型推理                  │
+│  1. 需要查患者病历（是否有出血史？）      │
+│  2. 需要检查药物相互作用（阿司匹林+降糖药） │
+│  3. 需要查文献（最新指南）                │
+└─────────────────┬───────────────────────┘
+                  ▼
+┌─────────────────────────────────────────┐
+│           Agent 循环（通用）             │
+│  while 模型要调用工具:                   │
+│      执行领域工具 → 返回结果 → 继续推理    │
+└─────────────────────────────────────────┘
+                  │
+    ┌─────────────┼─────────────┐
+    ▼             ▼             ▼
+┌───────┐    ┌───────┐    ┌──────────┐
+│query_ │    │check_ │    │search_   │
+│patient│    │drug_  │    │medical_  │
+│record │    │interaction│ literature│
+└───────┘    └───────┘    └──────────┘
+    │             │             │
+    ▼             ▼             ▼
+  病历数据      药品数据库      PubMed API
+```
+
+---
+
+## 七、关键心智模型
+
+### 7.1 Agent 与 Harness 的关系
+
+| 组件                         | 职责          | 类比     |
+| -------------------------- | ----------- | ------ |
+| Agent（模型）                  | 决策、推理、规划    | 大脑/驾驶者 |
+| Harness（框架）                | 工具、知识、权限、执行 | 手脚/载具  |
+| "造好 Harness，Agent 会完成剩下的。" |             |        |
+
+### 7.2 控制流归属
+
+| 类型          | 控制流在哪里                   | 特点         |
+| ----------- | ------------------------ | ---------- |
+| 真 Agent     | 模型内部（`finish_reason` 决定） | 动态、自适应、泛化  |
+| 伪 Agent/工作流 | 开发者代码（硬编码 if-else）       | 固定、脆弱、不可扩展 |
+
+### 7.3 API 适配的本质
+
+```Plain
+不同厂商的 API 只是"包装不同"：
+- 请求本质相同：给模型历史消息 + 可用工具
+- 响应本质相同：模型回复 + 是否调用工具 + 调用什么
+- 差异：字段名、嵌套结构、停止标志的值
+
+适配工作 = 解析不同格式 → 提取相同语义 → 统一处理逻辑
+```
+
+### 7.4 为什么看不懂代码？
+
+**代码的每一步都在"拆包裹"（解析 API 返回）或"打包裹"（构造下次请求的参数）。看不懂是因为没见过包裹长什么样。**
+
+**解决方法**：在代码里加打印，实际运行看结构：
+
+```Python
+def agent_loop(messages: list):
+    while True:
+        response = client.chat.completions.create(...)
+
+        # ===== 加这些打印 =====
+        print("=== API 原始返回 ===")
+        print(f"finish_reason: {response.choices[0].finish_reason}")
+
+        message = response.choices[0].message
+        print(f"content: {message.content}")
+        print(f"tool_calls: {message.tool_calls}")
+        if message.tool_calls:
+            for tc in message.tool_calls:
+                print(f"  - id: {tc.id}")
+                print(f"  - name: {tc.function.name}")
+                print(f"  - args: {tc.function.arguments}")
+        print("===================")
+        # =====================
+
+        # ... 后面逻辑
+```
+
+运行一次，看到实际数据，立刻就懂了。
+
+---
+
+## 八、完整适配代码示例
+
+```Python
+#!/usr/bin/env python3
+"""
+s01_agent_loop_qwen.py - Agent 循环的 Qwen3.5 适配版本
+"""
+
+import os
+import json
+import subprocess
+from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ========== 配置 ==========
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
+)
+MODEL = os.getenv("QWEN_MODEL_ID", "qwen-plus")
+
+SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        }
+    }
+]
+
+
+def run_bash(command: str) -> str:
+    """安全执行 bash 命令"""
+    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+    if any(d in command for d in dangerous):
+        return "Error: Dangerous command blocked"
+    try:
+        r = subprocess.run(
+            command, shell=True, cwd=os.getcwd(),
+            capture_output=True, text=True, timeout=120
+        )
+        out = (r.stdout + r.stderr).strip()
+        return out[:50000] if out else "(no output)"
+    except subprocess.TimeoutExpired:
+        return "Error: Timeout (120s)"
+
+
+def agent_loop(messages: list):
+    """核心 Agent 循环（Qwen/OpenAI 版本）"""
+    while True:
+        # 1. 调用模型
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SYSTEM}] + messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            max_tokens=8000,
+        )
+
+        message = response.choices[0].message
+
+        # 2. 记录助手消息
+        assistant_msg = {
+            "role": "assistant",
+            "content": message.content or ""
+        }
+        if message.tool_calls:
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments
+                    }
+                } for tc in message.tool_calls
+            ]
+        messages.append(assistant_msg)
+
+        # 3. 检查停止原因
+        finish_reason = response.choices[0].finish_reason
+        if finish_reason != "tool_calls":
+            return
+
+        # 4. 执行工具
+        for tool_call in message.tool_calls:
+            name = tool_call.function.name
+            try:
+                arguments = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError:
+                arguments = {}
+
+            if name == "bash":
+                command = arguments.get("command", "")
+                print(f"\033[33m$ {command}\033[0m")
+                output = run_bash(command)
+                print(output[:200])
+
+                # 5. 工具结果反馈（OpenAI 格式）
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": output
+                })
+
+
+if __name__ == "__main__":
+    history = []
+    while True:
+        try:
+            query = input("\033[36mqwen >> \033[0m")
+        except (EOFError, KeyboardInterrupt):
+            break
+        if query.strip().lower() in ("q", "exit", ""):
+            break
+        history.append({"role": "user", "content": query})
+        agent_loop(history)
+        # 打印最终回复
+        last_msg = history[-1]
+        if isinstance(last_msg.get("content"), str) and last_msg["content"]:
+            print(last_msg["content"])
+        print()
+```
+
+---
+
+## 参考资源
+
+- 原仓库：[https://github.com/shareAI-lab/learn-claude-code](https://github.com/shareAI-lab/learn-claude-code)
+
+- Qwen API 文档：[https://help.aliyun.com/zh/dashscope/](https://help.aliyun.com/zh/dashscope/)
+
+- OpenAI API 格式：[https://platform.openai.com/docs/api-reference/chat](https://platform.openai.com/docs/api-reference/chat)
